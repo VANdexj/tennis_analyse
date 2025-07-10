@@ -1,148 +1,192 @@
-from utils import (read_video, 
-                   save_video,
-                   measure_distance,
-                   draw_player_stats,
-                   convert_pixel_distance_to_meters
-                   )
-import constants
-from trackers import PlayerTracker,BallTracker
-from court_line_detector import CourtLineDetector
-from mini_court import MiniCourt
 import cv2
 import pandas as pd
 from copy import deepcopy
+from utils import (
+    measure_distance,
+    draw_player_stats,
+    convert_pixel_distance_to_meters,
+    save_video,
+    get_center_of_bbox
+)
+import constants
+from trackers import PlayerTracker, BallTracker
+from court_line_detector import CourtLineDetector
+from mini_court import MiniCourt
 
+
+def update_average_speeds(stats):
+    for key in stats.keys():
+        if key.endswith('_number_of_shots'):
+            pid = key.split('_')[1]
+            # 平均击球速度
+            shots = stats[f'player_{pid}_number_of_shots']
+            total_shot_speed = stats[f'player_{pid}_total_shot_speed']
+            stats[f'player_{pid}_average_shot_speed'] = total_shot_speed / shots if shots > 0 else 0
+
+        if key.endswith('_total_player_speed'):
+            pid = key.split('_')[1]
+            total_player_speed = stats[f'player_{pid}_total_player_speed'] # 平均跑动速度
+            # 这里假设你想统计总跑动速度和次数类似击球次数，否则需要自己定义累计次数
+            # 如果没有累积跑动速度的次数，可以用frame数代替，或者另设字段
+            # 这里简化用当前帧数作为跑动速度累积的除数
+            stats[f'player_{pid}_average_player_speed'] = total_player_speed / stats['frame_num'] if stats['frame_num'] > 0 else 0
+    return stats
 
 def main():
-    # Read Video
-    input_video_path = "input_videos/input_video.mp4"
-    video_frames = read_video(input_video_path)
+    input_video_path = "input_videos/1.mp4"
+    output_video_path = "output_videos/1_output.mp4"
 
-    # Detect Players and Ball
-    player_tracker = PlayerTracker(model_path='yolov8x')
+    cap = cv2.VideoCapture(input_video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
+
+    player_tracker = PlayerTracker(model_path='yolov8n.bin')
     ball_tracker = BallTracker(model_path='models/yolo5_last.pt')
+    court_line_detector = CourtLineDetector("models/keypoints_model.pth")
 
-    player_detections = player_tracker.detect_frames(video_frames,
-                                                     read_from_stub=True,
-                                                     stub_path="tracker_stubs/player_detections.pkl"
-                                                     )
-    ball_detections = ball_tracker.detect_frames(video_frames,
-                                                     read_from_stub=True,
-                                                     stub_path="tracker_stubs/ball_detections.pkl"
-                                                     )
-    ball_detections = ball_tracker.interpolate_ball_positions(ball_detections)
-    
-    
-    # Court Line Detector model
-    court_model_path = "models/keypoints_model.pth"
-    court_line_detector = CourtLineDetector(court_model_path)
-    court_keypoints = court_line_detector.predict(video_frames[0])
-
-    # choose players
-    player_detections = player_tracker.choose_and_filter_players(court_keypoints, player_detections)
-
-    # MiniCourt
-    mini_court = MiniCourt(video_frames[0]) 
-
-    # Detect ball shots
-    ball_shot_frames= ball_tracker.get_ball_shot_frames(ball_detections)
-
-    # Convert positions to mini court positions
-    player_mini_court_detections, ball_mini_court_detections = mini_court.convert_bounding_boxes_to_mini_court_coordinates(player_detections, 
-                                                                                                          ball_detections,
-                                                                                                          court_keypoints)
-
+    all_player_detections = {}
+    all_ball_detections = {}
     player_stats_data = [{
-        'frame_num':0,
-        'player_1_number_of_shots':0,
-        'player_1_total_shot_speed':0,
-        'player_1_last_shot_speed':0,
-        'player_1_total_player_speed':0,
-        'player_1_last_player_speed':0,
+        'frame_num': 0,
+        'player_1_number_of_shots': 0,
+        'player_1_total_shot_speed': 0,
+        'player_1_last_shot_speed': 0,
+        'player_1_total_player_speed': 0,
+        'player_1_last_player_speed': 0,
+        'player_2_number_of_shots': 0,
+        'player_2_total_shot_speed': 0,
+        'player_2_last_shot_speed': 0,
+        'player_2_total_player_speed': 0,
+        'player_2_last_player_speed': 0,
+    }]
 
-        'player_2_number_of_shots':0,
-        'player_2_total_shot_speed':0,
-        'player_2_last_shot_speed':0,
-        'player_2_total_player_speed':0,
-        'player_2_last_player_speed':0,
-    } ]
-    
-    for ball_shot_ind in range(len(ball_shot_frames)-1):
-        start_frame = ball_shot_frames[ball_shot_ind]
-        end_frame = ball_shot_frames[ball_shot_ind+1]
-        ball_shot_time_in_seconds = (end_frame-start_frame)/24 # 24fps
+    court_keypoints = None
+    mini_court = None
+    chosen_players = []
 
-        # Get distance covered by the ball
-        distance_covered_by_ball_pixels = measure_distance(ball_mini_court_detections[start_frame][1],
-                                                           ball_mini_court_detections[end_frame][1])
-        distance_covered_by_ball_meters = convert_pixel_distance_to_meters( distance_covered_by_ball_pixels,
-                                                                           constants.DOUBLE_LINE_WIDTH,
-                                                                           mini_court.get_width_of_mini_court()
-                                                                           ) 
+    player_mini_court_detections = {}
+    ball_mini_court_detections = {}
 
-        # Speed of the ball shot in km/h
-        speed_of_ball_shot = distance_covered_by_ball_meters/ball_shot_time_in_seconds * 3.6
+    frame_id = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-        # player who the ball
-        player_positions = player_mini_court_detections[start_frame]
-        player_shot_ball = min( player_positions.keys(), key=lambda player_id: measure_distance(player_positions[player_id],
-                                                                                                 ball_mini_court_detections[start_frame][1]))
+        player_dets = player_tracker.detect_frame(frame)
+        ball_dets = ball_tracker.detect_frame(frame)
 
-        # opponent player speed
-        opponent_player_id = 1 if player_shot_ball == 2 else 2
-        distance_covered_by_opponent_pixels = measure_distance(player_mini_court_detections[start_frame][opponent_player_id],
-                                                                player_mini_court_detections[end_frame][opponent_player_id])
-        distance_covered_by_opponent_meters = convert_pixel_distance_to_meters( distance_covered_by_opponent_pixels,
-                                                                           constants.DOUBLE_LINE_WIDTH,
-                                                                           mini_court.get_width_of_mini_court()
-                                                                           ) 
+        all_player_detections[frame_id] = player_dets
+        all_ball_detections[frame_id] = ball_dets
 
-        speed_of_opponent = distance_covered_by_opponent_meters/ball_shot_time_in_seconds * 3.6
+        if frame_id == 0:
+            court_keypoints = court_line_detector.predict(frame)
+            chosen_players = player_tracker.choose_players(court_keypoints, player_dets)
+            # 用真实 ID 初始化 stats
+            initial_stats = {
+                'frame_num': 0,
+            }
+            for pid in chosen_players:
+                initial_stats[f'player_{pid}_number_of_shots'] = 0
+                initial_stats[f'player_{pid}_total_shot_speed'] = 0
+                initial_stats[f'player_{pid}_last_shot_speed'] = 0
+                initial_stats[f'player_{pid}_total_player_speed'] = 0
+                initial_stats[f'player_{pid}_last_player_speed'] = 0
+                initial_stats[f'player_{pid}_average_shot_speed'] = 0
+                initial_stats[f'player_{pid}_average_player_speed'] = 0
+            player_stats_data = [initial_stats]
+            player_dets = {k: v for k, v in player_dets.items() if k in chosen_players}
+            mini_court = MiniCourt(frame)
+        else:
+            player_dets = {k: v for k, v in player_dets.items() if k in chosen_players}
 
-        current_player_stats= deepcopy(player_stats_data[-1])
-        current_player_stats['frame_num'] = start_frame
-        current_player_stats[f'player_{player_shot_ball}_number_of_shots'] += 1
-        current_player_stats[f'player_{player_shot_ball}_total_shot_speed'] += speed_of_ball_shot
-        current_player_stats[f'player_{player_shot_ball}_last_shot_speed'] = speed_of_ball_shot
+        player_positions_mini = {}
+        for pid, bbox in player_dets.items():
+            player_positions_mini[pid] = mini_court.convert_bbox_to_mini_court_coords(bbox, court_keypoints)  # TODO: 替换为真实 mini court 坐标
 
-        current_player_stats[f'player_{opponent_player_id}_total_player_speed'] += speed_of_opponent
-        current_player_stats[f'player_{opponent_player_id}_last_player_speed'] = speed_of_opponent
+        ball_pos = ball_dets.get(1, None)
+        if ball_pos:
+            ball_center = get_center_of_bbox(ball_pos)
+            ball_pos_mini = mini_court.convert_bbox_to_mini_court_coords(
+        [ball_center[0], ball_center[1], ball_center[0], ball_center[1]],
+        court_keypoints
+    )
+            ball_positions_mini = {1: ball_pos_mini}  # TODO: 替换为真实 mini court 坐标
+            
+        else:
+            ball_positions_mini = {1: (0, 0)}
 
-        player_stats_data.append(current_player_stats)
+        player_mini_court_detections[frame_id] = player_positions_mini
+        ball_mini_court_detections[frame_id] = ball_positions_mini
 
-    player_stats_data_df = pd.DataFrame(player_stats_data)
-    frames_df = pd.DataFrame({'frame_num': list(range(len(video_frames)))})
-    player_stats_data_df = pd.merge(frames_df, player_stats_data_df, on='frame_num', how='left')
-    player_stats_data_df = player_stats_data_df.ffill()
+        # 补全：球速与跑动速度逻辑（仅在有前一帧时执行）
+        if frame_id > 0:
+            prev_frame_id = frame_id - 1
+            ball_prev = ball_mini_court_detections[prev_frame_id][1]
+            ball_curr = ball_mini_court_detections[frame_id][1]
+            player_prev = player_mini_court_detections[prev_frame_id]
+            player_curr = player_mini_court_detections[frame_id]
 
-    player_stats_data_df['player_1_average_shot_speed'] = player_stats_data_df['player_1_total_shot_speed']/player_stats_data_df['player_1_number_of_shots']
-    player_stats_data_df['player_2_average_shot_speed'] = player_stats_data_df['player_2_total_shot_speed']/player_stats_data_df['player_2_number_of_shots']
-    player_stats_data_df['player_1_average_player_speed'] = player_stats_data_df['player_1_total_player_speed']/player_stats_data_df['player_2_number_of_shots']
-    player_stats_data_df['player_2_average_player_speed'] = player_stats_data_df['player_2_total_player_speed']/player_stats_data_df['player_1_number_of_shots']
+            ball_distance_pixels = measure_distance(ball_prev, ball_curr)
+            ball_distance_meters = convert_pixel_distance_to_meters(
+                ball_distance_pixels,
+                constants.DOUBLE_LINE_WIDTH,
+                mini_court.get_width_of_mini_court()
+            )
+            ball_speed_kmph = ball_distance_meters * fps * 3.6
 
+            player_distances = {}
+            for pid in chosen_players:
+                if pid in player_prev and pid in player_curr:
+                    player_distance_pixels = measure_distance(player_prev[pid], player_curr[pid])
+                    player_distance_meters = convert_pixel_distance_to_meters(
+                        player_distance_pixels,
+                        constants.DOUBLE_LINE_WIDTH,
+                        mini_court.get_width_of_mini_court()
+                    )
+                    player_distances[pid] = player_distance_meters * fps * 3.6
+                else:
+                    # 如果缺少检测位置，速度设为0或跳过
+                    player_distances[pid] = 0
 
+            # 判断谁击球（离球更近的）
+            shooter_id = min(player_curr.keys(), key=lambda pid: measure_distance(player_curr[pid], ball_curr))
+            opponent_id = [pid for pid in chosen_players if pid != shooter_id][0]
 
-    # Draw output
-    ## Draw Player Bounding Boxes
-    output_video_frames= player_tracker.draw_bboxes(video_frames, player_detections)
-    output_video_frames= ball_tracker.draw_bboxes(output_video_frames, ball_detections)
+            current_stats = deepcopy(player_stats_data[-1])
+            current_stats['frame_num'] = frame_id
+            current_stats[f'player_{shooter_id}_number_of_shots'] += 1
+            current_stats[f'player_{shooter_id}_total_shot_speed'] += ball_speed_kmph
+            current_stats[f'player_{shooter_id}_last_shot_speed'] = ball_speed_kmph
+            current_stats[f'player_{opponent_id}_total_player_speed'] += player_distances[opponent_id]
+            current_stats[f'player_{opponent_id}_last_player_speed'] = player_distances[opponent_id]
+            # 平均速度计算
+            current_stats = update_average_speeds(current_stats)
+            
+            player_stats_data.append(current_stats)
+        else:
+            current_stats = deepcopy(player_stats_data[-1])
+            current_stats = update_average_speeds(current_stats)
+            player_stats_data.append(current_stats)
 
-    ## Draw court Keypoints
-    output_video_frames  = court_line_detector.draw_keypoints_on_video(output_video_frames, court_keypoints)
+        # 可视化
+        frame = player_tracker.draw_bboxes([frame], [player_dets])[0]
+        frame = ball_tracker.draw_bboxes([frame], [ball_dets])[0]
+        frame = court_line_detector.draw_keypoints_on_video([frame], court_keypoints)[0]
+        frame = mini_court.draw_mini_court([frame])[0]
+        frame = mini_court.draw_points_on_mini_court([frame], {0: player_positions_mini})[0]
+        frame = mini_court.draw_points_on_mini_court([frame], {0: ball_positions_mini}, color=(0, 255, 255))[0]
+        frame = draw_player_stats([frame], pd.DataFrame([player_stats_data[-1]]),chosen_players)[0]
 
-    # Draw Mini Court
-    output_video_frames = mini_court.draw_mini_court(output_video_frames)
-    output_video_frames = mini_court.draw_points_on_mini_court(output_video_frames,player_mini_court_detections)
-    output_video_frames = mini_court.draw_points_on_mini_court(output_video_frames,ball_mini_court_detections, color=(0,255,255))    
+        cv2.putText(frame, f"Frame: {frame_id}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        out.write(frame)
+        frame_id += 1
 
-    # Draw Player Stats
-    output_video_frames = draw_player_stats(output_video_frames,player_stats_data_df)
-
-    ## Draw frame number on top left corner
-    for i, frame in enumerate(output_video_frames):
-        cv2.putText(frame, f"Frame: {i}",(10,30),cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-    save_video(output_video_frames, "output_videos/output_video.mp4")
+    cap.release()
+    out.release()
 
 if __name__ == "__main__":
     main()
